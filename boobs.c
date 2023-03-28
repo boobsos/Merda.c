@@ -240,7 +240,7 @@ static void *_slabrealloc(void *ptr, size_t size);
 static void _slabfree(void *ptr);
 static void *_vmem_alloc(size_t bytes, size_t align, int flags);
 static void *magazine_alloc(struct magazine *, int *);
-static int magazine_free(struct magazine *, void *);
+static slzone_t zone_alloc(int flags);
 static void *zone_alloc(int flags);
 static void zone_free(void *z);
 static void _vmem_free(void *ptr, size_t bytes);
@@ -1083,13 +1083,13 @@ magazine_free(struct magazine *mp, void *p)
  * zone_alloc()
  *
  */
-static void *
+static slzone_t
 zone_alloc(int flags) 
 {
 	slglobaldata_t slgd = &SLGlobalData;
 	int burst = 1;
 	int i, j;
-	void *z;
+	slzone_t z;
 
 	zone_magazine_lock();
 
@@ -1105,6 +1105,8 @@ zone_alloc(int flags)
 		}
 
         slgd_lock(slgd);
+    } else {
+	    z->z_Flags |= SLZF_UNOTZEROD;
 	}
 
     zone_magazine_unlock();
@@ -1126,9 +1128,8 @@ zone_free(void *z)
 	zone_magazine_lock();
 	slgd_unlock(slgd);
 
-	/* XXX: Find a way to make this unnecessary */
 	bzero(z, sizeof(struct slzone));
-
+    
 	i = magazine_free(&zone_magazine, z);
 	/* If we failed to free, its because the zone magazine is full; we want to
 	 * reduce its load to the low factor by releasing memory to the system. We
