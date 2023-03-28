@@ -174,6 +174,47 @@ typedef struct slglobaldata {
 			    } while (0)
 
 /*
+ * Magazines 
+ */
+
+#define M_MAX_ROUNDS	64
+#define M_LOW_ROUNDS	32
+#define M_INIT_ROUNDS	8
+#define M_BURST_FACTOR	8
+#define M_BURST_NSCALE	2
+
+#define M_BURST		0x0001
+#define M_BURST_EARLY	0x0002
+#define M_STAND		0x0004
+
+struct magazine {
+	SLIST_ENTRY(magazine) magazinelist;
+
+	int		flags;
+	int 		capacity;	/* Max rounds in this magazine */
+	int 		rounds;		/* Current number of free rounds */ 
+	int		burst_factor;	/* Number of blocks to prefill with */
+	int 		low_factor;	/* Free till low_factor from full mag */
+	void		*objects[M_MAX_ROUNDS];
+};
+
+SLIST_HEAD(magazinelist, magazine);
+
+static struct magazine zone_magazine = {
+	.flags = M_BURST_EARLY | M_STAND,
+	.capacity = M_MAX_ROUNDS,
+	.rounds = 0,
+	.burst_factor = M_BURST_FACTOR,
+	.low_factor = M_LOW_ROUNDS
+};
+
+
+#define MAGAZINE_FULL(mp)	(mp->rounds == mp->capacity)
+#define MAGAZINE_NOTFULL(mp)	(mp->rounds < mp->capacity)
+#define MAGAZINE_EMPTY(mp)	(mp->rounds == 0)
+#define MAGAZINE_NOTEMPTY(mp)	(mp->rounds != 0)
+
+/*
  * Fixed globals (not per-cpu)
  */
 static const int ZoneSize = ZALLOC_ZONE_SIZE;
@@ -198,6 +239,9 @@ static void *_slaballoc(size_t size, int flags);
 static void *_slabrealloc(void *ptr, size_t size);
 static void _slabfree(void *ptr);
 static void *_vmem_alloc(size_t bytes, size_t align, int flags);
+static void *magazine_alloc(struct magazine *, int *);
+static int magazine_prefill(struct magazine *, void **, int);
+static int magazine_free(struct magazine *, void *);
 static void *zone_alloc(int flags);
 static void zone_free(void *z);
 static void _vmem_free(void *ptr, size_t bytes);
@@ -939,6 +983,7 @@ _slabfree(void *ptr)
 		z->z_Magic = -1;
 		z->z_Next = NULL;
 		zone_free(z);
+        return;
 	}
 	slgd_unlock(slgd);
 }
@@ -977,6 +1022,36 @@ chunk_mark_free(slzone_t z, void *chunk)
 
 #endif
 
+static void *
+magazine_alloc(struct magazine *mp, int *burst)
+{
+	void *obj;
+
+	if (mp != NULL && MAGAZINE_NOTEMPTY(mp)) {
+		obj = mp->objects[--mp->rounds];
+		return (obj);
+	}
+
+	return NULL;
+}
+
+static int
+magazine_prefill(struct magazine *m, void **ptrs, int num)
+{
+
+}
+
+static int
+magazine_free(struct magazine *mp, void *p)
+{
+	if (mp != NULL && MAGAZINE_NOTFULL(mp)) {
+		mp->objects[mp->rounds++] = p;
+		return 0;
+	}
+
+	return -1;
+}
+
 /*
  * zone_alloc()
  *
@@ -984,17 +1059,40 @@ chunk_mark_free(slzone_t z, void *chunk)
 static void *
 zone_alloc(int flags) 
 {
-	return _vmem_alloc(ZoneSize, ZoneSize, flags);
+	slglobaldata_t slgd = &SLGlobalData;
+	int burst;
+	void *z;
+
+	z = magazine_alloc(&zone_magazine, &burst);
+	if (z == NULL) {
+		slgd_unlock(slgd);
+		z = _vmem_alloc(ZoneSize, ZoneSize, flags);
+		slgd_lock(slgd);
+
+	}
+
+	return z;
 }
 
 /*
  * zone_free()
- *
+ * Releases the slgd lock prior to unmap, if unmapping is necessary
  */
 static void
 zone_free(void *z)
 {
-	return _vmem_free(z, ZoneSize);
+	slglobaldata_t slgd = &SLGlobalData;
+	int i;
+
+	/* XXX: Find a way to make this unnecessary */
+	bzero(z, ZoneSize);
+
+	i = magazine_free(&zone_magazine, z);
+	if (i == -1) {
+		slgd_unlock(slgd);
+		_vmem_free(z, ZoneSize);
+	}
+
 }
 
 /*
