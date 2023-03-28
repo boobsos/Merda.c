@@ -187,7 +187,7 @@ typedef struct slglobaldata {
 #define M_STAND		0x0004
 
 struct magazine {
-	SLIST_ENTRY(magazine) magazinelist;
+	SLIST_ENTRY(magazine) nextmagazine;
 
 	int		flags;
 	int 		capacity;	/* Max rounds in this magazine */
@@ -238,12 +238,7 @@ typedef struct thr_mags {
 
 static __thread thr_mags thread_mags TLS_ATTRIBUTE;
 
-#define SWAP_MAGAZINES(mp_p)					\
-	do {							\
-		struct magazine *__tmp_m = mp_p->loaded;	\
-		mp_p->loaded = mp_p->prev;			\
-		mp_p->prev = __tmp_m;				\
-	} while (0)
+static magazine_depot depots[NZONES];
 
 
 /*
@@ -310,6 +305,20 @@ slgd_unlock(slglobaldata_t slgd)
 }
 
 static __inline void
+depot_lock(magazine_depot *dp) 
+{
+	if (__isthreaded)
+		_SPINLOCK(&dp->lock);
+}
+
+static __inline void
+depot_unlock(magazine_depot *dp)
+{
+	if (__isthreaded)
+		_SPINUNLOCK(&dp->lock);
+}
+
+static __inline void
 zone_magazine_lock(void)
 {
 	if (__isthreaded)
@@ -322,6 +331,16 @@ zone_magazine_unlock(void)
 	if (__isthreaded)
 		_SPINLOCK(&zone_mag_lock);
 }
+
+static __inline void
+swap_mags(magazine_pair *mp)
+{
+	struct magazine *tmp;
+	tmp = mp->loaded;
+	mp->loaded = mp->prev;
+	mp->prev = tmp;
+}
+
 
 
 /*
@@ -941,7 +960,6 @@ _slabfree(void *ptr)
 	bigalloc_t *bigp;
 	slglobaldata_t slgd;
 	size_t size;
-	int chunking;
 	int zi;
 	int i;
 	int pgno;
@@ -984,7 +1002,7 @@ _slabfree(void *ptr)
 	MASSERT(z->z_Magic == ZALLOC_SLAB_MAGIC);
 
 	size = z->z_ChunkSize;
-	zi = zoneindex(&size, &chunking);
+	zi = z->z_ZoneIndex;
 	i = mtmagazine_free(zi, ptr);
 	if (i == 0)
 		return;
@@ -1092,7 +1110,7 @@ chunk_mark_free(slzone_t z, void *chunk)
 
 #endif
 
-static void *
+static __inline void *
 magazine_alloc(struct magazine *mp, int *burst)
 {
 	void *obj =  NULL;
@@ -1124,7 +1142,7 @@ magazine_alloc(struct magazine *mp, int *burst)
     return obj;
 }
 
-static int
+static __inline int
 magazine_free(struct magazine *mp, void *p)
 {
 	if (mp != NULL && MAGAZINE_NOTFULL(mp)) {
@@ -1138,13 +1156,171 @@ magazine_free(struct magazine *mp, void *p)
 static void *
 mtmagazine_alloc(int zi)
 {
-	return NULL;
+	thr_mags *tp;
+	struct magazine *mp, *emptymag;
+	magazine_depot *d;
+	void *obj = NULL;
+
+	tp = &thread_mags;
+
+	do {
+		/* If the loaded magazine has rounds, allocate and return */
+		if (((mp = tp->mags[zi].loaded) != NULL) &&
+		    MAGAZINE_NOTEMPTY(mp)) {
+			obj = magazine_alloc(mp, NULL);
+			break;
+		}
+
+		/* If the prev magazine is full, swap with loaded and retry */
+		if (((mp = tp->mags[zi].prev) != NULL) &&
+		    MAGAZINE_FULL(mp)) {
+			swap_mags(&tp->mags[zi]);
+			continue;
+		}
+
+		/* Lock the depot and check if it has any full magazines; if so
+		 * we return the prev to the emptymag list, move loaded to prev
+		 * load a full magazine, and retry */
+		d = &depots[zi];
+		depot_lock(d);
+
+		if (!SLIST_EMPTY(&d->full)) {
+			emptymag = tp->mags[zi].prev;
+			tp->mags[zi].prev = tp->mags[zi].loaded;
+			tp->mags[zi].loaded = SLIST_FIRST(&d->full);
+			SLIST_REMOVE_HEAD(&d->full, nextmagazine);
+
+			/* Return emptymag to the depot */
+			SLIST_INSERT_HEAD(&d->empty, emptymag, nextmagazine);
+
+			depot_unlock(d);
+			continue;
+		} else {
+			depot_unlock(d);
+		}
+
+	} while (0);
+
+	return (obj);
+}
+
+}
+
+static int
+mtmagazine_free(int zi, void *ptr)
+{
+    	thr_mags *tp;
+	struct magazine *mp, *emptymag;
+	magazine_depot *d;
+	void *obj = NULL;
+
+	tp = &thread_mags;
+
+	do {
+		/* If the loaded magazine has rounds, allocate and return */
+		if (((mp = tp->mags[zi].loaded) != NULL) &&
+		    MAGAZINE_NOTEMPTY(mp)) {
+			obj = magazine_alloc(mp, NULL);
+			break;
+		}
+
+		/* If the prev magazine is full, swap with loaded and retry */
+		if (((mp = tp->mags[zi].prev) != NULL) &&
+		    MAGAZINE_FULL(mp)) {
+			swap_mags(&tp->mags[zi]);
+			continue;
+		}
+
+		/* Lock the depot and check if it has any full magazines; if so
+		 * we return the prev to the emptymag list, move loaded to prev
+		 * load a full magazine, and retry */
+		d = &depots[zi];
+		depot_lock(d);
+
+		if (!SLIST_EMPTY(&d->full)) {
+			emptymag = tp->mags[zi].prev;
+			tp->mags[zi].prev = tp->mags[zi].loaded;
+			tp->mags[zi].loaded = SLIST_FIRST(&d->full);
+			SLIST_REMOVE_HEAD(&d->full, nextmagazine);
+
+			/* Return emptymag to the depot */
+			SLIST_INSERT_HEAD(&d->empty, emptymag, nextmagazine);
+
+			depot_unlock(d);
+			continue;
+		} else {
+			depot_unlock(d);
+		}
+
+	} while (0);
+
+	return (obj);
 }
 
 static int
 mtmagazine_free(int zi, void *ptr)
 {
 	return -1;
+	thr_mags *tp;
+	struct magazine *mp, *loadedmag, *newmag;
+	magazine_depot *d;
+	int rc = -1;
+
+	tp = &thread_mags;
+
+	do {
+		/* If the loaded magazine has space, free directly to it */
+		if (((mp = tp->mags[zi].loaded) != NULL) && 
+		    MAGAZINE_NOTFULL(mp)) {
+			rc = magazine_free(mp, ptr);
+			break;
+		}
+
+		/* If the prev magazine is empty, swap with loaded and retry */
+		if (((mp = tp->mags[zi].prev) != NULL) &&
+		    MAGAZINE_EMPTY(mp)) {
+			swap_mags(&tp->mags[zi]);
+			continue;
+		}
+
+		/* Lock the depot; if there are any empty magazines, move the
+		 * prev to the depot's fullmag list, move loaded to previous,
+		 * and move a new emptymag to loaded, and retry. */
+
+		d = &depots[zi];
+		depot_lock(d);
+
+		if (!SLIST_EMPTY(&d->empty)) {
+			loadedmag = tp->mags[zi].prev;
+			tp->mags[zi].prev = tp->mags[zi].loaded;
+			tp->mags[zi].loaded = SLIST_FIRST(&d->empty);
+			SLIST_REMOVE_HEAD(&d->empty, nextmagazine);
+
+			/* Return loadedmag to the depot */
+			if (loadedmag != NULL)
+				SLIST_INSERT_HEAD(&d->full, loadedmag, 
+						  nextmagazine);
+			depot_unlock(d);
+			continue;
+		} 
+
+		/* Allocate an empty magazine, add it to the depot, retry */
+		newmag = _slaballoc(sizeof(struct magazine), SAFLAG_ZERO);
+		if (newmag != NULL) {
+			newmag->capacity = M_MAX_ROUNDS;
+			newmag->flags = M_STAND;
+			newmag->rounds = 0;
+
+			SLIST_INSERT_HEAD(&d->empty, newmag, nextmagazine);
+			depot_unlock(d);
+			continue;
+		} else {
+			depot_unlock(d);
+			rc = -1;
+		}
+	} while (0);
+
+	return rc;
 }
 
 /*
@@ -1199,9 +1375,9 @@ zone_free(void *z)
 	bzero(z, sizeof(struct slzone));
 
 	i = magazine_free(&zone_magazine, z);
-	/* If we failed to free, its because the zone magazine is full; we want to
-	 * reduce its load to the low factor by releasing memory to the system. We
-	 * collect the excess zones and then release them one-by-one, without locks */
+	/* If we failed to free, collect excess magazines; release the zone
+	 * magazine lock, and then free to the system via _vmem_free. Re-enable
+	 * BURST mode for the magazine. */
 	if (i == -1) {
 		j = zone_magazine.rounds - zone_magazine.low_factor;
 		for (i = 0; i < j; i++) {
