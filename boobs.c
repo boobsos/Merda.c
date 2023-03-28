@@ -178,7 +178,7 @@ typedef struct slglobaldata {
  */
 
 #define M_MAX_ROUNDS	64
-#define M_LOW_ROUNDS	32
+#define M_LOW_ROUNDS	48
 #define M_INIT_ROUNDS	8
 #define M_BURST_FACTOR	8
 #define M_BURST_NSCALE	2
@@ -1053,7 +1053,8 @@ magazine_alloc(struct magazine *mp, int *burst)
 		}
 
 		/* Reduce burst factor by NSCALE; if it hits 1, disable BURST */
-		if ((mp->flags & M_BURST) && (mp->flags & M_BURST_EARLY)) {
+		if ((mp->flags & M_BURST) && (mp->flags & M_BURST_EARLY) &&
+		    (burst != NULL)) {
 			mp->burst_factor /= M_BURST_NSCALE;
 			if (mp->burst_factor <= 1) {
 				mp->burst_factor = 1;
@@ -1119,18 +1120,40 @@ static void
 zone_free(void *z)
 {
 	slglobaldata_t slgd = &SLGlobalData;
-	int i;
+	void *excess[M_MAX_ROUNDS - M_LOW_ROUNDS] = {};
+	int i, j;
+
+	zone_magazine_lock();
+	slgd_unlock(slgd);
 
 	/* XXX: Find a way to make this unnecessary */
 	bzero(z, sizeof(struct slzone));
 
-	zone_magazine_lock();
 	i = magazine_free(&zone_magazine, z);
-    zone_magazine_unlock();
-    
+	/* If we failed to free, its because the zone magazine is full; we want to
+	 * reduce its load to the low factor by releasing memory to the system. We
+	 * collect the excess zones and then release them one-by-one, without locks */
 	if (i == -1) {
-		slgd_unlock(slgd);
+		j = zone_magazine.rounds - zone_magazine.low_factor;
+		for (i = 0; i < j; i++) {
+			excess[i] = magazine_alloc(&zone_magazine, NULL);
+			MASSERT(excess[i] !=  NULL);
+		}
+
+		/* Re-enable M_BURST */
+		zone_magazine.flags |= M_BURST;
+		zone_magazine.flags |= M_BURST_EARLY;
+		zone_magazine.burst_factor = M_BURST_FACTOR;
+
+		zone_magazine_unlock();
+
+		for (i = 0; i < j; i++) 
+			_vmem_free(excess[i], ZoneSize);
+
 		_vmem_free(z, ZoneSize);
+        
+    } else {
+		zone_magazine_unlock();
 	}
 
 }
