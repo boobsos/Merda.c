@@ -1,6 +1,6 @@
 /*
  *
- * $Id$
+ * $Id$: boobs.c, v 1.3
 */
 /*
  * This module implements a slab allocator drop-in replacement for the
@@ -127,8 +127,6 @@ typedef struct slzone {
 typedef struct slglobaldata {
 	spinlock_t	Spinlock;
 	slzone_t	ZoneAry[NZONES];/* linked list of zones NFree > 0 */
-	slzone_t	FreeZones;	/* whole zones that have become free */
-	int		NFreeZones;	/* free zone count */
 	int		JunkIndex;
 } *slglobaldata_t;
 
@@ -141,7 +139,6 @@ typedef struct slglobaldata {
  */
 #define MIN_CHUNK_SIZE		8		/* in bytes */
 #define MIN_CHUNK_MASK		(MIN_CHUNK_SIZE - 1)
-#define ZONE_RELS_THRESH	4		/* threshold number of zones */
 #define IN_SAME_PAGE_MASK	(~(intptr_t)PAGE_MASK | MIN_CHUNK_MASK)
 
 /*
@@ -201,6 +198,8 @@ static void *_slaballoc(size_t size, int flags);
 static void *_slabrealloc(void *ptr, size_t size);
 static void _slabfree(void *ptr);
 static void *_vmem_alloc(size_t bytes, size_t align, int flags);
+static void *zone_alloc(int flags);
+static void zone_free(void *z);
 static void _vmem_free(void *ptr, size_t bytes);
 static void _mpanic(const char *ctl, ...);
 #if defined(INVARIANTS)
@@ -591,27 +590,10 @@ _slaballoc(size_t size, int flags)
 	 * exhausted pull one off the free list or allocate a new one.
 	 */
 	if ((z = slgd->ZoneAry[zi]) == NULL) {
-		/*
-		 * Pull the zone off the free list.  If the zone on
-		 * the free list happens to be correctly set up we
-		 * do not have to reinitialize it.
-		 */
-		if ((z = slgd->FreeZones) != NULL) {
-			slgd->FreeZones = z->z_Next;
-			--slgd->NFreeZones;
-			if (z->z_ChunkSize == size) {
-				z->z_Magic = ZALLOC_SLAB_MAGIC;
-				z->z_Next = slgd->ZoneAry[zi];
-				slgd->ZoneAry[zi] = z;
-				goto have_zone;
-			}
-			bzero(z, sizeof(struct slzone));
-			z->z_Flags |= SLZF_UNOTZEROD;
-		} else {
-			z = _vmem_alloc(ZoneSize, ZoneSize, flags);
-			if (z == NULL)
-				goto fail;
-		}
+            z = zone_alloc(flags);
+		    if (z == NULL)
+			    goto fail;
+
 
 		/*
 		 * How big is the base structure?
@@ -632,7 +614,7 @@ _slaballoc(size_t size, int flags)
 		/*
 		 * Align the storage in the zone based on the chunking.
 		 *
-		 * Guarentee power-of-2 alignment for power-of-2-sized
+		 * Guarantee power-of-2 alignment for power-of-2-sized
 		 * chunks.  Otherwise align based on the chunking size
 		 * (typically 8 or 16 bytes for small allocations).
 		 *
@@ -678,7 +660,6 @@ _slaballoc(size_t size, int flags)
 	 *
 	 * Remove us from the ZoneAry[] when we become empty
 	 */
-have_zone:
 	MASSERT(z->z_NFree > 0);
 
 	if (--z->z_NFree == 0) {
@@ -946,19 +927,8 @@ _slabfree(void *ptr)
 	}
 
 	/*
-	 * If the zone becomes totally free then move this zone to
-	 * the FreeZones list.
-	 *
-	 * Do not madvise here, avoiding the edge case where a malloc/free
-	 * loop is sitting on the edge of a new zone.
-	 *
-	 * We could leave at least one zone in the ZoneAry for the index,
-	 * using something like the below, but while this might be fine
-	 * for the kernel (who cares about ~10MB of wasted memory), it
-	 * probably isn't such a good idea for a user program.
-	 *
-	 * 	&& (z->z_Next || slgd->ZoneAry[z->z_ZoneIndex] != z)
-	 */
+    * If the zone becomes totally free then release it.
+     */
 	if (z->z_NFree == z->z_NMax) {
 		slzone_t *pz;
 
@@ -967,21 +937,8 @@ _slabfree(void *ptr)
 			pz = &(*pz)->z_Next;
 		*pz = z->z_Next;
 		z->z_Magic = -1;
-		z->z_Next = slgd->FreeZones;
-		slgd->FreeZones = z;
-		++slgd->NFreeZones;
-	}
-
-	/*
-	 * Limit the number of zones we keep cached.
-	 */
-	while (slgd->NFreeZones > ZONE_RELS_THRESH) {
-		z = slgd->FreeZones;
-		slgd->FreeZones = z->z_Next;
-		--slgd->NFreeZones;
-		slgd_unlock(slgd);
-		_vmem_free(z, ZoneSize);
-		slgd_lock(slgd);
+		z->z_Next = NULL;
+		zone_free(z);
 	}
 	slgd_unlock(slgd);
 }
@@ -1019,6 +976,26 @@ chunk_mark_free(slzone_t z, void *chunk)
 }
 
 #endif
+
+/*
+ * zone_alloc()
+ *
+ */
+static void *
+zone_alloc(int flags) 
+{
+	return _vmem_alloc(ZoneSize, ZoneSize, flags);
+}
+
+/*
+ * zone_free()
+ *
+ */
+static void
+zone_free(void *z)
+{
+	return _vmem_free(z, ZoneSize);
+}
 
 /*
  * _vmem_alloc()
